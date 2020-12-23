@@ -1,0 +1,167 @@
+---
+title: "Kaggle Titanic"
+author: "Pan Si Cheng Steven, Lau Justin"
+date: "5/11/2020"
+output: html_document
+---
+
+```{r}
+library(tidyverse)
+library(dplyr)
+library(ggplot2)
+library(ISLR)
+library(alr4)
+library(randomForest)
+library(gbm)
+library(caret)
+library(e1071)
+```
+
+##Step 1 - Set up datasets
+
+We begin our project by reading in the training and test data provided. We assign a new column named "set" in the data to differentiate between the data sources via training/testing sets. We add an empty NA column into test and merge them into a full set to clean up our data.
+
+```{r}
+train <- read.csv('train.csv')
+test <- read.csv('test.csv')
+
+train$set <- "train"
+test$set <- "test"
+test$Survived <- NA
+full <- rbind(train,test)
+```
+
+##Step 2 - Clean up data and build features based on analytical constraints
+
+We begin by filling NA data in our given variable Age by assigning the median of each age based on the passenger class to explore our data.
+
+```{r}
+
+for (val in c(1,2,3) ) {
+full$Age[is.na(full$Age) & full$Sex == 'male' & full$Pclass == val] = median(full[full$Sex == 'male' & full$Pclass == val, ]$Age,na.rm = TRUE)
+full$Age[is.na(full$Age) & full$Sex == 'female' & full$Pclass == val] = median(full[full$Sex == 'female' & full$Pclass == val,]$Age, na.rm = TRUE)
+}
+```
+
+```{r pressure, echo=FALSE}
+visualtrain <- train
+
+for (val in c(1,2,3) ) {
+visualtrain$Age[is.na(visualtrain$Age) & visualtrain$Sex == 'male' & visualtrain$Pclass == val] = median(visualtrain[visualtrain$Sex == 'male' & visualtrain$Pclass == val, ]$Age,na.rm = TRUE)
+visualtrain$Age[is.na(visualtrain$Age) & visualtrain$Sex == 'female' & visualtrain$Pclass == val] = median(visualtrain[visualtrain$Sex == 'female' & visualtrain$Pclass == val,]$Age, na.rm = TRUE)
+}
+
+ggplot(visualtrain %>% dplyr::filter(Pclass!=3), aes(Age)) + geom_density(alpha=0.5, aes(fill=factor(Survived))) + labs(title="Survival density per Age  for Pclass 1 and 2 and")
+```
+
+After replacing our NA values in Age with the median age of passengers via class, we notice that the survival rates between the ages drastically vary when we try to roughly classify them into age groups age<13, 13 >= age < 18,18 >= age < 55,age >= 55+. we create the features AgeGroup and clean the rest of the data up to remove missing values in 'Embarked' with the initial port of embarkment 'S'. We notice a relationship in sibsp and parch variables as they account for the same families and create a new feature called 'FamilySized' to account for both features, allowing consistent analysis in our model.
+
+```{r}
+
+#Create feature 'Age Group' for minors/adults/elderly aka create a cosistent-time stratified variable
+full <- full %>%
+  mutate('AgeGroup' = case_when(Age < 13 ~ "Children",
+                                 Age >= 13 & Age <= 18 ~ "Teen",
+                                 Age >= 18 & Age < 55 ~ "Adult",
+                                 Age >= 55 ~ "Elderly"))
+
+#Replace NA with S (Initial boarding)
+full$Embarked[full$Embarked==''] = 'S'
+
+#Create feature 'FamilySized' to merge correlation of sibsp and parch 
+full$FamilySize <-full$SibSp + full$Parch + 1 
+full$FamilySized[full$FamilySize == 1] <- 'Single' 
+full$FamilySized[full$FamilySize < 5 & full$FamilySize >= 2] <- 'Small' 
+full$FamilySized[full$FamilySize >= 5] <- 'Big' 
+full$FamilySized=as.factor(full$FamilySized)
+```
+
+After this, we explore the relationship between the features Sex and Pclass vs. Survived. 
+
+```{r}
+p <- list();
+graph <- 1;
+ylim <- 300;
+for(class in c(1:3)){
+  for(sex in c("male", "female")) {
+    p[[graph]] <- ggplot(full[1:891,] %>% dplyr::filter(Pclass==class, Sex==sex), aes(x=Survived)) + 
+    geom_bar(aes(fill=Survived)) + scale_y_continuous(limits=c(0,ylim)) + 
+    theme(legend.position="none") + labs(title=paste('Pclass=', as.character(class), sex));
+    graph <- graph + 1;
+  }
+}
+do.call(grid.arrange, p)
+```
+
+From the graphs above, we decide to include both features in our model as we see a reasonable correlation in survival rates between the two features.
+We then note the relationship between the family size of the passengers and their survival outcomes via the plot:
+
+```{r}
+ggplot(full[1:891,], aes(x = FamilySized, fill = factor(Survived))) +
+  geom_bar(stat='count', position='dodge') + labs(x = 'Family Size', title = 'Family Size vs. Survival Count')
+```
+From the graph above, we note a disproportionate amount of 'Single' passengers that did not survive, and notice a contrasting relation between the various family size groups and conclude to include family size in our model. 
+
+Then we explore the relationship between where the passengers embarked against their survival via this plot:
+
+```{r}
+ggplot(full[1:891,], aes(x = Embarked, fill = factor(Survived))) + geom_bar(stat='count', position='dodge') + labs(x = 'Embarked')
+```
+
+From the above, we notice a disproportionate amount of deaths from passengers that embarked in the 'S' class and decide to include the Embarked feature in our model. Finally, we explore the relationship between Fare and Survival.
+
+```{r}
+ggplot(full[1:891,], aes(x = Fare, fill = factor(Survived))) +
+  geom_histogram() + labs(x = 'Fare', title = 'Fare vs. Survival Count')
+```
+
+From the histogram above, we note that passengers with a lower fare range approximately 0 < fare <=100 saw a much lower survival rate. As such, we decide to include the Fare feature within our model and thus conclude our data exploration and begin building out our working datasets.
+
+Step 3 - Build out complete training/testing sets
+
+```{r}
+completetrain <- full[1:891, c("Pclass","Sex", "AgeGroup", "FamilySized", "Fare", 'Embarked')]
+response <- as.factor(train$Survived)
+completetrain$AgeGroup=as.factor(completetrain$AgeGroup)
+
+completetest <- full[892:1309, c("Pclass","Sex", "AgeGroup", "FamilySized", "Fare", 'Embarked')]
+completetest$AgeGroup=as.factor(completetest$AgeGroup)
+completetest$Fare[is.na(completetest$Fare)] = median(completetest$Fare, na.rm = TRUE)
+```
+
+```{r}
+set.seed(42069)
+rf.train = randomForest(x=completetrain[,-7],y=response, ntree=1000, importance=TRUE)
+```
+
+After we apply the Random Forest algorithm to our dataset, we submit our prediction with the full model.
+
+```{r}
+importance  <- importance(rf.train)
+varImportance <- data.frame(Variables = row.names(importance), Importance = round(importance[ ,'MeanDecreaseGini'],2))
+
+rankImportance <- varImportance %>% mutate(Rank = paste0('#',dense_rank(desc(Importance))))
+```
+
+```{r}
+submit = data.frame(PassengerId = test$PassengerId)
+submit$Survived = predict(rf.train, completetest )
+write.csv(submit, file = 'randomForest_submit5.csv', row.names=FALSE)
+```
+
+From the Kaggle testing, we found an accuracy of 80.382%. (We do this instead of implementing self testing as the Kaggle testing dataset is inconsistent with the provided test set)
+
+After this, we plot a variable importance plot to see if we can further improve our model.
+
+```{r}
+
+ggplot(rankImportance, aes(x = reorder(Variables, Importance), 
+  y = Importance, fill = Importance)) +
+  geom_bar(stat='identity') + 
+  geom_text(aes(x = Variables, y = 0.5, label = Rank),
+  hjust=0, vjust=0.55, size = 4, colour = 'red') +
+  labs(x = 'Variables') +
+  coord_flip()
+```
+
+From the plot, we notice that Embarked is the lowest variable of importance and decide to explore a model without the variable Embarked. We submit this result to the Kaggle testing and find an accuracy of 77.99% and decide to retain the variable in our final submission with accuracy 80.328%.
